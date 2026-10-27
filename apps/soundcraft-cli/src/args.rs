@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use clap::builder::NonEmptyStringValueParser;
@@ -70,6 +70,9 @@ pub(crate) struct ConvertArgs {
     /// Never dither
     #[arg(long)]
     pub(crate) no_dither: bool,
+    /// Allow an <OUT> that is the <IN> file, replacing the original
+    #[arg(long)]
+    pub(crate) in_place: bool,
 }
 
 /// Where `run` and `script` start, and what they do with the result.
@@ -96,6 +99,9 @@ pub(crate) struct EngineArgs {
     /// Print the session as JSON at the end
     #[arg(long)]
     pub(crate) inspect: bool,
+    /// Allow a --bounce or --save that is the --in session, replacing the original
+    #[arg(long, requires = "input")]
+    pub(crate) in_place: bool,
 }
 
 /// Run engine commands on a new, demo or saved session
@@ -185,6 +191,84 @@ pub(crate) struct ParityArgs {
     pub(crate) write: Option<PathBuf>,
 }
 
+impl Command {
+    /// The outputs clap can't check: one that is an input file, however it is spelt, or both of
+    /// `--bounce` and `--save` naming one file. The paths are compared before any work starts and
+    /// written later, so a link swapped in meanwhile goes unnoticed: this guards against mistakes,
+    /// it is not a security boundary.
+    fn check_outputs(&self) -> Result<(), OutputError> {
+        match self {
+            Self::Convert(a) if !a.in_place && same_file(&a.input, &a.output) => {
+                Err(OutputError::ReplacesInput { output: "<OUT>", input: "<IN> file", path: a.output.clone() })
+            }
+            Self::Run(a) => a.engine.check_outputs(None),
+            Self::Script(a) => a.engine.check_outputs(Some(&a.file)),
+            Self::Info(_)
+            | Self::Convert(_)
+            | Self::Commands(_)
+            | Self::Describe(_)
+            | Self::App(_)
+            | Self::Mcp(_)
+            | Self::Parity(_)
+            | Self::Plugins => Ok(()),
+        }
+    }
+}
+
+impl EngineArgs {
+    /// `script` is the script file `script` runs, which no flag lets an output replace.
+    fn check_outputs(&self, script: Option<&Path>) -> Result<(), OutputError> {
+        for (flag, path) in [("--bounce", &self.bounce), ("--save", &self.save)] {
+            let Some(path) = path else { continue };
+            if script.is_some_and(|script| same_file(script, path)) {
+                return Err(OutputError::ReplacesScript { output: flag, path: path.clone() });
+            }
+            if !self.in_place && self.input.as_ref().is_some_and(|input| same_file(input, path)) {
+                return Err(OutputError::ReplacesInput { output: flag, input: "--in session", path: path.clone() });
+            }
+        }
+        match (&self.bounce, &self.save) {
+            (Some(bounce), Some(save)) if same_file(bounce, save) => Err(OutputError::SameOutputs(save.clone())),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether `a` and `b` name one file, however spelt (`a.wav`, `./a.wav`, a symbolic or hard link).
+/// When either exists, only two regular files can be one, compared by identity (device and inode);
+/// a FIFO or device is never opened, so the check can't block. When neither exists yet, they are
+/// one if they would be created at the same place.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a.exists() || b.exists() {
+        return a.is_file() && b.is_file() && same_file::is_same_file(a, b).unwrap_or(false);
+    }
+    matches!((destination(a), destination(b)), (Some(a), Some(b)) if a == b)
+}
+
+/// Where a file that doesn't exist yet would be created: its folder resolved, links followed.
+fn destination(path: &Path) -> Option<PathBuf> {
+    let folder = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    Some(folder.canonicalize().ok()?.join(path.file_name()?))
+}
+
+/// An output [`Command::check_outputs`] refuses: `parse` prints it as a usage error (exit 2).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OutputError {
+    #[error("{output} {} is the {input}, which it would replace: choose another file, or pass --in-place", .path.display())]
+    ReplacesInput { output: &'static str, input: &'static str, path: PathBuf },
+    #[error("{output} {} is the script file, which it would replace: choose another file", .path.display())]
+    ReplacesScript { output: &'static str, path: PathBuf },
+    #[error("--bounce and --save both name {}, so the save would replace the bounce: choose another file for one of them", .0.display())]
+    SameOutputs(PathBuf),
+}
+
+impl OutputError {
+    /// Two arguments that may not name one file: clap's conflict kind.
+    fn into_clap(self, cmd: &mut clap::Command) -> clap::Error {
+        cmd.error(ErrorKind::ArgumentConflict, self)
+    }
+}
+
 /// The bit depths `convert` writes. `32` is the same as `32f`.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum BitDepthArg {
@@ -272,8 +356,10 @@ fn long_version() -> &'static str {
 
 /// Parse the arguments (without the binary name). clap reads them as `OsString`s: a folder need
 /// not be valid Unicode, text must. A flag wins over its environment variable, unless that is
-/// empty, and a bad value from one is a usage error naming the variable. A bare `--help` or `-h` is help even after a mistake on the
-/// same line (`run --bounce --help`): clap reports the mistake first.
+/// empty, and a bad value from one is a usage error naming the variable. A bare `--help` or `-h`
+/// is help even after a mistake on the same line (`run --bounce --help`): clap reports the mistake
+/// first. An output that would replace an input is refused here too
+/// ([`Command::check_outputs`]), so nothing has run when it is reported.
 pub(crate) fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
     let mut cmd = Cli::command().mut_subcommands(|sub| sub.mut_args(blank_env_is_unset));
     let argv = std::iter::once(OsString::from("soundcraft-cli")).chain(args.iter().cloned());
@@ -287,5 +373,12 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
         }
         matches => matches?,
     };
-    Cli::from_arg_matches(&matches)
+    let cli = Cli::from_arg_matches(&matches)?;
+    if let Err(e) = cli.command.check_outputs() {
+        return Err(match matches.subcommand_name().and_then(|name| cmd.find_subcommand_mut(name)) {
+            Some(sub) => e.into_clap(sub),
+            None => e.into_clap(&mut cmd),
+        });
+    }
+    Ok(cli)
 }
