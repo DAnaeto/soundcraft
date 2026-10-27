@@ -14,6 +14,8 @@ pub(crate) enum CliError {
     UnknownCommand(String),
     #[error("{id}: {source}")]
     Command { id: String, source: EngineError },
+    #[error("one or more script commands failed")]
+    ScriptFailed,
     #[error("{}:{line}: bad JSON: {source}", path.display())]
     ScriptJson { path: PathBuf, line: usize, source: serde_json::Error },
     #[error("{}:{line}: {id}: {source}", path.display())]

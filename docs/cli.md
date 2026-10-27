@@ -32,6 +32,12 @@ soundcraft-cli commands bounce
 soundcraft-cli describe file.bounce_mix
 ```
 
+With `script --keep-going`, later commands and requested bounce or save actions still run after a
+command fails. The exit code is nonzero if any command failed, even if the remaining work succeeds.
+Malformed JSON stops the script immediately, including with `--keep-going`.
+Finish actions stop at the first finish error. An in-place save can replace the input session with
+partially applied work when earlier commands failed.
+
 ## Output and exit codes
 
 Results go to standard output, as JSON where a program is meant to read them. `info` (on an audio

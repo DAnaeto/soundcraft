@@ -243,9 +243,83 @@ fn script_line_errors_stop_unless_keep_going() {
     assert_eq!((stop.code, stop.stdout.as_str()), (1, ""));
     assert_eq!(stop.stderr, "error: bad.txt:1: nosuch.cmd: unknown command `nosuch.cmd`\n");
     let keep = invoke(&dir, &["script", "bad.txt", "--keep-going"]);
-    assert_eq!((keep.code, keep.stdout.as_str()), (0, "track.new: {\"tracks\":[1]}\n"));
-    assert_eq!(keep.stderr, "bad.txt:1: nosuch.cmd: unknown command `nosuch.cmd`\n");
+    assert_eq!((keep.code, keep.stdout.as_str()), (1, "track.new: {\"tracks\":[1]}\n"));
+    assert_eq!(keep.stderr, "bad.txt:1: nosuch.cmd: unknown command `nosuch.cmd`\nerror: one or more script commands failed\n");
     assert_fails(&invoke(&dir, &["script", "badjson.txt"]), "badjson.txt:1: bad JSON: key must be a string at line 1 column 2");
+}
+
+#[test]
+fn script_keep_going_reports_failure_after_running_later_commands_and_saving() {
+    let dir = sandbox("script-keep-going-failure");
+    std::fs::write(dir.join("audit.txt"), "audit.deliberately_invalid {}\ntrack.new {\"name\":\"After failure\"}\nsession.inspect {}\n").unwrap();
+
+    let stop = invoke(&dir, &["script", "audit.txt", "--demo", "--bounce", "stop.wav", "--start", "0", "--end", "0.1", "--save", "stop.scraft"]);
+    assert_eq!(stop.code, 1);
+    assert!(stop.stderr.contains("audit.deliberately_invalid"), "{}", stop.stderr);
+    assert!(!stop.stdout.contains("session.inspect:"), "{}", stop.stdout);
+    assert!(!dir.join("stop.wav").exists() && !dir.join("stop.scraft").exists());
+
+    let keep = invoke(
+        &dir,
+        &[
+            "script",
+            "audit.txt",
+            "--keep-going",
+            "--demo",
+            "--bounce",
+            "after.wav",
+            "--start",
+            "0",
+            "--end",
+            "0.1",
+            "--save",
+            "after.scraft",
+            "--inspect",
+            "--compact",
+        ],
+    );
+    assert!(keep.stderr.contains("audit.deliberately_invalid"), "{}", keep.stderr);
+    assert!(keep.stdout.contains("track.new:"), "{}", keep.stdout);
+    assert!(keep.stdout.contains("session.inspect:"), "{}", keep.stdout);
+    assert!(dir.join("after.scraft").exists());
+    assert!(rate_of(&dir, "after.wav") > 0);
+    let inspect: serde_json::Value = serde_json::from_str(keep.stdout.lines().last().unwrap()).unwrap();
+    assert!(inspect["tracks"].is_array(), "{}", keep.stdout);
+    let reopened = invoke(&dir, &["run", "--in", "after.scraft", "--inspect", "--compact"]);
+    assert_eq!(reopened.code, 0, "{}", reopened.stderr);
+    let saved: serde_json::Value = serde_json::from_str(reopened.stdout.trim()).unwrap();
+    assert!(saved["tracks"].as_array().unwrap().iter().any(|track| track["name"] == "After failure"));
+    assert_eq!(keep.code, 1);
+}
+
+#[test]
+fn script_continues_after_engine_error_and_reports_finish_failure() {
+    let dir = sandbox("script-engine-and-finish-errors");
+    std::fs::write(dir.join("engine-error.txt"), "session.save {}\nsession.inspect {}\n").unwrap();
+
+    let got = invoke(&dir, &["script", "engine-error.txt", "--keep-going", "--save", "in.wav/out.scraft"]);
+    assert_eq!(got.code, 1);
+    assert!(got.stdout.contains("session.inspect:"), "{}", got.stdout);
+    assert!(got.stderr.contains("engine-error.txt:1: session.save:"), "{}", got.stderr);
+    assert!(got.stderr.contains("in.wav"), "{}", got.stderr);
+}
+
+#[test]
+fn script_success_and_finish_errors_keep_their_exit_status() {
+    let dir = sandbox("script-finish-status");
+    let success = invoke(&dir, &["script", "s.txt", "--keep-going"]);
+    assert_eq!(success.code, 0, "{}", success.stderr);
+    for (option, path) in [("--save", "in.wav/out.scraft"), ("--bounce", "in.wav/out.wav")] {
+        let failed = invoke(&dir, &["script", "s.txt", "--keep-going", option, path]);
+        assert_eq!(failed.code, 1, "{option}: {}", failed.stdout);
+        assert!(failed.stderr.contains("in.wav"), "{option}: {}", failed.stderr);
+    }
+    std::fs::write(dir.join("badjson.txt"), "track.new {}\ntrack.new {x\ntrack.new {}\n").unwrap();
+    let malformed = invoke(&dir, &["script", "badjson.txt", "--keep-going", "--save", "badjson.scraft"]);
+    assert_eq!(malformed.code, 1);
+    assert_eq!(malformed.stdout, "track.new: {\"tracks\":[1]}\n");
+    assert!(malformed.stderr.contains("badjson.txt:2: bad JSON"), "{}", malformed.stderr);
+    assert!(!dir.join("badjson.scraft").exists());
 }
 
 #[test]

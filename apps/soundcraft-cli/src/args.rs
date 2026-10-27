@@ -126,13 +126,13 @@ pub(crate) struct RunArgs {
 
 /// Run a file of engine commands, one `ID JSON` per line
 ///
-/// Blank lines and lines starting with # are skipped. A failing line stops the script unless
-/// --keep-going is given.
+/// Blank lines and lines starting with # are skipped. A failing command stops the script unless
+/// --keep-going is given; malformed JSON always stops it.
 #[derive(Args)]
 pub(crate) struct ScriptArgs {
     /// The script to run
     pub(crate) file: PathBuf,
-    /// Report a failing line and go on with the next
+    /// Report command errors and continue; run requested finish actions, but exit nonzero if any command failed
     #[arg(long)]
     pub(crate) keep_going: bool,
     #[command(flatten)]
